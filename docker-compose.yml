@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Chromium в Docker требует отключения sandbox
+    environment:
+      PUPPETEER_CONFIG_PATH: /app/puppeteer-config.json
+    # Разрешаем /dev/shm для Chromium (предотвращает crashes)
+    shm_size: "256mb"
