@@ -1,290 +1,253 @@
 #!/usr/bin/env python3
 """
-Telegram бот: аудио → Mermaid-диаграмма (только OpenAI).
+HuggingFace Daily Papers — Telegram Bot
 
-Поток:
-  аудио → Whisper (транскрипция) → GPT-4o (генерация Mermaid) →
-  → рендер (mmdc / mermaid.ink) → если ошибка → GPT-4o (исправление) → ...
+Команды:
+  /start               — справка
+  /papers              — статьи за вчера
+  /papers YYYY-MM-DD   — статьи за указанную дату
+
+Навигация кнопками ◀️ / ▶️.
+Если задан CHAT_ID, каждый день в DAILY_HOUR UTC бот присылает статьи автоматически.
 """
 
-import base64
 import logging
 import os
-import re
-import subprocess
-import tempfile
-from pathlib import Path
+from datetime import datetime, timedelta, timezone, time as dt_time
+
+import html
 
 import httpx
-from openai import OpenAI
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from openai import AsyncOpenAI
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
-# ── Логирование ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── Конфигурация ──────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
-GPT_MODEL        = os.environ.get("GPT_MODEL", "gpt-4o")
-MAX_FIX_ATTEMPTS = int(os.environ.get("MAX_FIX_ATTEMPTS", "5"))
-PUPPETEER_CONFIG = os.environ.get("PUPPETEER_CONFIG_PATH", "puppeteer-config.json")
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+GPT_MODEL = os.environ.get("GPT_MODEL", "gpt-4o-mini")
+CHAT_ID = os.environ.get("CHAT_ID")          # optional: for daily scheduled push
+DAILY_HOUR = int(os.environ.get("DAILY_HOUR", "9"))  # UTC hour for daily push
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-
-# ════════════════════════════════════════════════════════════════════════════════
-# ТРАНСКРИПЦИЯ (Whisper)
-# ════════════════════════════════════════════════════════════════════════════════
-
-def transcribe_audio(audio_path: str) -> str:
-    with open(audio_path, "rb") as f:
-        result = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-        )
-    return result.text.strip()
+HF_API = "https://huggingface.co/api/daily_papers"
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# ГЕНЕРАЦИЯ И ИСПРАВЛЕНИЕ MERMAID (GPT-4o)
-# ════════════════════════════════════════════════════════════════════════════════
+# ── HuggingFace API ────────────────────────────────────────────────────────────
 
-_GENERATE_SYSTEM = """\
-Ты эксперт по Mermaid-диаграммам. Получив текст, создаёшь наиболее подходящую \
-Mermaid-диаграмму. Возвращаешь ТОЛЬКО блок кода — ничего лишнего.
-
-Правила синтаксиса:
-- ID узлов: только буквы/цифры/подчёркивания, без пробелов.
-- Метки со спецсимволами (скобки, двоеточие, апостроф и т.д.) — в двойных кавычках: A["Метка (пример)"].
-- Стрелки строго по документации: -->, ---, -.-> и т.д.
-- Типы диаграмм: graph/flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, mindmap, timeline, erDiagram."""
-
-_FIX_SYSTEM = """\
-Ты эксперт по исправлению Mermaid-диаграмм. Получаешь код и ошибку рендеринга — \
-возвращаешь ТОЛЬКО исправленный блок кода, без пояснений.
-
-Чеклист:
-1. Верное ключевое слово типа диаграммы.
-2. ID узлов — только буквенно-цифровые + подчёркивание.
-3. Метки со спецсимволами — в двойных кавычках.
-4. Корректный синтаксис стрелок.
-5. Все упоминаемые узлы определены.
-6. Нет незакрытых скобок или кавычек."""
+async def fetch_papers(date: str) -> list[dict]:
+    """Fetch papers list from HuggingFace API for given date (YYYY-MM-DD)."""
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.get(HF_API, params={"date": date})
+        r.raise_for_status()
+        data = r.json()
+    return data if isinstance(data, list) else []
 
 
-def _extract_mermaid(text: str) -> str:
-    m = re.search(r"```mermaid\s*\n(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    m = re.search(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
+# ── OpenAI Summarization ───────────────────────────────────────────────────────
 
-
-def _gpt(system: str, user: str) -> str:
-    resp = client.chat.completions.create(
+async def summarize(title: str, abstract: str) -> str:
+    """Generate 2-3 sentence plain-language summary in Russian."""
+    if not abstract:
+        return "Аннотация недоступна."
+    resp = await openai_client.chat.completions.create(
         model=GPT_MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        max_tokens=2048,
-        temperature=0.2,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Напиши саммари научной статьи в 2-3 предложения простым языком на русском:\n"
+                "— какую проблему решали\n"
+                "— метод или подход\n"
+                "— главный результат\n\n"
+                f"Название: {title}\n\n"
+                f"Аннотация: {abstract}"
+            ),
+        }],
+        max_tokens=200,
+        temperature=0.3,
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content.strip()
 
 
-def generate_mermaid(transcript: str) -> str:
-    user_msg = (
-        f"Создай Mermaid-диаграмму по следующей транскрипции:\n\n{transcript}"
+# ── Card UI ───────────────────────────────────────────────────────────────────
+
+def card_text(paper: dict, idx: int, total: int) -> str:
+    p = paper["paper"]
+    title = html.escape(p["title"])
+    summary = html.escape(paper.get("_summary", ""))
+    authors = p.get("authors", [])
+    names = html.escape(", ".join(a["name"] for a in authors[:3]))
+    if len(authors) > 3:
+        names += " et al."
+    date_raw = p.get("publishedAt", "")[:10]
+    return (
+        f"<b>{idx + 1} / {total}</b>\n\n"
+        f"<b>{title}</b>\n\n"
+        f"{summary}\n\n"
+        f"👥 <i>{names}</i>\n"
+        f"📅 {date_raw}"
     )
-    return _extract_mermaid(_gpt(_GENERATE_SYSTEM, user_msg))
 
 
-def fix_mermaid(code: str, error: str) -> str:
-    user_msg = (
-        f"Диаграмма не рендерится. Ошибка:\n{error}\n\n"
-        f"Код:\n```mermaid\n{code}\n```"
+def card_keyboard(idx: int, total: int, paper_id: str) -> InlineKeyboardMarkup:
+    nav_row = []
+    if idx > 0:
+        nav_row.append(InlineKeyboardButton("◀️", callback_data=f"nav:{idx - 1}"))
+    nav_row.append(InlineKeyboardButton(f"{idx + 1}/{total}", callback_data="noop"))
+    if idx < total - 1:
+        nav_row.append(InlineKeyboardButton("▶️", callback_data=f"nav:{idx + 1}"))
+    open_btn = InlineKeyboardButton(
+        "📖 Открыть статью",
+        url=f"https://huggingface.co/papers/{paper_id}",
     )
-    return _extract_mermaid(_gpt(_FIX_SYSTEM, user_msg))
+    return InlineKeyboardMarkup([nav_row, [open_btn]])
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# РЕНДЕРИНГ MERMAID
-# ════════════════════════════════════════════════════════════════════════════════
+# ── Core ──────────────────────────────────────────────────────────────────────
 
-def _render_mmdc(code: str, out: str) -> tuple[bool, str]:
-    """Рендер через локальный mermaid-cli (mmdc)."""
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".mmd", delete=False, encoding="utf-8"
-    ) as f:
-        f.write(code)
-        inp = f.name
-
-    cmd = ["mmdc", "-i", inp, "-o", out, "-b", "white", "--quiet"]
-    if Path(PUPPETEER_CONFIG).exists():
-        cmd.extend(["-p", PUPPETEER_CONFIG])
-
+async def load_and_send(
+    chat_id: int,
+    date_str: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    status_msg=None,
+) -> None:
+    """Fetch, summarize, and send the first paper card to the chat."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
-        if r.returncode == 0 and Path(out).exists() and Path(out).stat().st_size > 100:
-            return True, ""
-        err = (r.stderr or r.stdout or f"exit {r.returncode}").strip()
-        return False, err
-    except FileNotFoundError:
-        return False, "mmdc_not_found"
-    except subprocess.TimeoutExpired:
-        return False, "mmdc timeout (40 с)"
-    finally:
-        Path(inp).unlink(missing_ok=True)
-
-
-def _render_ink(code: str, out: str) -> tuple[bool, str]:
-    """Рендер через mermaid.ink API (fallback)."""
-    payload = base64.urlsafe_b64encode(code.encode()).decode()
-    url = f"https://mermaid.ink/img/{payload}?bgColor=white"
-    try:
-        r = httpx.get(url, timeout=25, follow_redirects=True)
-        ct = r.headers.get("content-type", "")
-        if r.status_code == 200 and "image" in ct and len(r.content) > 100:
-            Path(out).write_bytes(r.content)
-            return True, ""
-        return False, f"mermaid.ink HTTP {r.status_code}: {r.text[:300]}"
-    except httpx.TimeoutException:
-        return False, "mermaid.ink timeout"
-    except Exception as e:
-        return False, f"mermaid.ink: {e}"
-
-
-def render_mermaid(code: str, out: str) -> tuple[bool, str]:
-    """Пробует mmdc, при неудаче — mermaid.ink."""
-    ok, err = _render_mmdc(code, out)
-    if ok:
-        return True, ""
-    if err == "mmdc_not_found":
-        logger.info("mmdc не найден → mermaid.ink")
-    else:
-        logger.warning("mmdc: %s → mermaid.ink", err)
-    return _render_ink(code, out)
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TELEGRAM ОБРАБОТЧИКИ
-# ════════════════════════════════════════════════════════════════════════════════
-
-async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message
-
-    if msg.voice:
-        tg_file = await msg.voice.get_file()
-        suffix = ".ogg"
-    elif msg.audio:
-        tg_file = await msg.audio.get_file()
-        suffix = Path(msg.audio.file_name or "audio.mp3").suffix or ".mp3"
-    elif msg.document and "audio" in (msg.document.mime_type or ""):
-        tg_file = await msg.document.get_file()
-        suffix = Path(msg.document.file_name or "audio.mp3").suffix or ".mp3"
-    else:
-        await msg.reply_text("Пожалуйста, отправьте аудио-файл или голосовое сообщение.")
+        papers = await fetch_papers(date_str)
+    except httpx.HTTPError as exc:
+        text = f"❌ Ошибка загрузки: {exc}"
+        if status_msg:
+            await status_msg.edit_text(text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text)
         return
 
-    status = await msg.reply_text("⏳ Загружаю аудио…")
+    if not papers:
+        text = f"За {date_str} статей не найдено."
+        if status_msg:
+            await status_msg.edit_text(text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        return
 
-    async def upd(text: str) -> None:
-        try:
-            await status.edit_text(text)
-        except Exception:
-            pass
-
-    with tempfile.TemporaryDirectory() as tmp:
-        audio_path = os.path.join(tmp, f"audio{suffix}")
-        await tg_file.download_to_drive(audio_path)
-
-        # 1. Транскрипция
-        await upd("🎙️ Транскрибирую аудио (Whisper)…")
-        try:
-            transcript = transcribe_audio(audio_path)
-        except Exception as e:
-            logger.exception("Transcription error")
-            await upd(f"❌ Ошибка транскрипции: {e}")
-            return
-
-        logger.info("Transcript (%d chars): %s…", len(transcript), transcript[:80])
-        preview = transcript[:300] + ("…" if len(transcript) > 300 else "")
-        await upd(f"✅ Транскрипция:\n{preview}\n\n⏳ Генерирую диаграмму (GPT-4o)…")
-
-        # 2. Генерация Mermaid
-        try:
-            mermaid_code = generate_mermaid(transcript)
-        except Exception as e:
-            logger.exception("Generation error")
-            await upd(f"❌ Ошибка генерации: {e}")
-            return
-
-        logger.info("Generated:\n%s", mermaid_code)
-
-        # 3. Цикл рендеринга / исправления
-        out_path = os.path.join(tmp, "diagram.png")
-
-        for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
-            await upd(f"🔄 Рендеринг (попытка {attempt}/{MAX_FIX_ATTEMPTS})…")
-
-            ok, error = render_mermaid(mermaid_code, out_path)
-
-            if ok:
-                await upd(
-                    f"✅ Готово! (попытка {attempt})\n\n"
-                    f"Mermaid-код:\n```\n{mermaid_code}\n```"
-                )
-                with open(out_path, "rb") as img:
-                    await msg.reply_photo(img, caption="📊 Mermaid-диаграмма")
-                return
-
-            logger.warning("Attempt %d failed: %s", attempt, error)
-
-            if attempt < MAX_FIX_ATTEMPTS:
-                await upd(
-                    f"⚠️ Попытка {attempt} не удалась:\n{error[:200]}\n\n"
-                    f"🔧 GPT-4o исправляет синтаксис…"
-                )
-                try:
-                    mermaid_code = fix_mermaid(mermaid_code, error)
-                    logger.info("Fixed:\n%s", mermaid_code)
-                except Exception as e:
-                    await upd(f"❌ Ошибка исправления: {e}")
-                    return
-
-        await upd(
-            f"❌ Не удалось отрендерить за {MAX_FIX_ATTEMPTS} попыток.\n\n"
-            f"Последний код:\n```\n{mermaid_code}\n```"
+    if status_msg:
+        await status_msg.edit_text(
+            f"⏳ Генерирую саммари для {len(papers)} статей…"
         )
 
+    for paper in papers:
+        if "_summary" not in paper:
+            p = paper["paper"]
+            paper["_summary"] = await summarize(p["title"], p.get("abstract", ""))
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 Привет! Отправь голосовое сообщение или аудио-файл.\n\n"
-        "Я транскрибирую его через Whisper, сгенерирую Mermaid-диаграмму "
-        "через GPT-4o и автоматически исправлю ошибки, если диаграмма "
-        "не отрендерится с первого раза."
+    # Persist state per chat
+    context.application.chat_data.setdefault(chat_id, {}).update(
+        {"papers": papers, "index": 0, "date": date_str}
     )
 
+    if status_msg:
+        await status_msg.delete()
+
+    paper = papers[0]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=card_text(paper, 0, len(papers)),
+        parse_mode="HTML",
+        reply_markup=card_keyboard(0, len(papers), paper["paper"]["id"]),
+    )
+
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "<b>HuggingFace Daily Papers Bot</b> 🤖\n\n"
+        "Команды:\n"
+        "• /papers — статьи за вчера\n"
+        "• /papers 2024-01-15 — статьи за конкретную дату\n\n"
+        "Листай карточки кнопками ◀️ ▶️",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_papers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args:
+        date_str = context.args[0]
+    else:
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        date_str = yesterday.strftime("%Y-%m-%d")
+
+    status = await update.message.reply_text(f"⏳ Загружаю статьи за {date_str}…")
+    await load_and_send(update.effective_chat.id, date_str, context, status)
+
+
+async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "noop":
+        return
+
+    chat_id = update.effective_chat.id
+    state = context.application.chat_data.get(chat_id, {})
+    papers = state.get("papers")
+
+    if not papers:
+        await query.edit_message_text("Сессия устарела — введите /papers заново.")
+        return
+
+    new_idx = int(query.data.split(":")[1])
+    if not (0 <= new_idx < len(papers)):
+        return
+
+    state["index"] = new_idx
+    paper = papers[new_idx]
+    await query.edit_message_text(
+        text=card_text(paper, new_idx, len(papers)),
+        parse_mode="HTML",
+        reply_markup=card_keyboard(new_idx, len(papers), paper["paper"]["id"]),
+    )
+
+
+# ── Scheduled job ─────────────────────────────────────────────────────────────
+
+async def daily_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CHAT_ID:
+        return
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    date_str = yesterday.strftime("%Y-%m-%d")
+    logger.info("Daily push: %s → chat %s", date_str, CHAT_ID)
+    await load_and_send(int(CHAT_ID), date_str, context)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(
-        MessageHandler(
-            filters.VOICE | filters.AUDIO | filters.Document.AUDIO,
-            on_audio,
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("papers", cmd_papers))
+    app.add_handler(CallbackQueryHandler(on_nav, pattern=r"^(nav:\d+|noop)$"))
+
+    if CHAT_ID:
+        app.job_queue.run_daily(
+            daily_job,
+            time=dt_time(hour=DAILY_HOUR, minute=0, tzinfo=timezone.utc),
         )
-    )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    logger.info("Bot running…")
+        logger.info("Daily job: %02d:00 UTC → chat %s", DAILY_HOUR, CHAT_ID)
+
+    logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
 

@@ -1,371 +1,339 @@
 """
-Тесты для bot.py.
+Тесты для bot.py (HuggingFace Daily Papers Bot).
 
-Все внешние зависимости (OpenAI, httpx, subprocess, Telegram) мокируются.
+Все внешние зависимости (OpenAI, httpx, Telegram) мокируются.
 """
 import os
-import subprocess
-import tempfile
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# Выставляем фейковые переменные окружения ДО импорта bot,
-# чтобы он не упал с KeyError и не обратился к реальному OpenAI.
+# Фейковые env vars ДО импорта bot
 os.environ.setdefault("TELEGRAM_TOKEN", "fake_token")
 os.environ.setdefault("OPENAI_API_KEY", "fake_api_key")
 
 import bot  # noqa: E402
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# _extract_mermaid
-# ════════════════════════════════════════════════════════════════════════════════
+# ── Fixtures ──────────────────────────────────────────────────────────────────
 
-class TestExtractMermaid:
-    def test_mermaid_code_block(self):
-        text = "```mermaid\ngraph TD\n  A --> B\n```"
-        assert bot._extract_mermaid(text) == "graph TD\n  A --> B"
-
-    def test_generic_code_block(self):
-        text = "```\ngraph TD\n  A --> B\n```"
-        assert bot._extract_mermaid(text) == "graph TD\n  A --> B"
-
-    def test_plain_text_returned_as_is(self):
-        text = "graph TD\n  A --> B"
-        assert bot._extract_mermaid(text) == "graph TD\n  A --> B"
-
-    def test_prefers_mermaid_block_over_generic(self):
-        text = "```\nignored\n```\n```mermaid\ngraph TD\n  A --> B\n```"
-        assert bot._extract_mermaid(text) == "graph TD\n  A --> B"
-
-    def test_strips_surrounding_whitespace(self):
-        text = "```mermaid\n\n  graph TD\n  A --> B\n\n```"
-        assert bot._extract_mermaid(text) == "graph TD\n  A --> B"
-
-    def test_multiline_diagram(self):
-        code = "sequenceDiagram\n  Alice->>Bob: Hi\n  Bob-->>Alice: Hello"
-        text = f"```mermaid\n{code}\n```"
-        assert bot._extract_mermaid(text) == code
+def make_paper(
+    paper_id: str = "2401.00001",
+    title: str = "Test Paper",
+    abstract: str = "This is an abstract.",
+    authors: list | None = None,
+    published: str = "2024-01-15T00:00:00",
+    summary: str | None = None,
+) -> dict:
+    p = {
+        "paper": {
+            "id": paper_id,
+            "title": title,
+            "abstract": abstract,
+            "authors": authors or [{"name": "Alice"}, {"name": "Bob"}],
+            "publishedAt": published,
+        }
+    }
+    if summary is not None:
+        p["_summary"] = summary
+    return p
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# generate_mermaid / fix_mermaid
-# ════════════════════════════════════════════════════════════════════════════════
+# ── fetch_papers ──────────────────────────────────────────────────────────────
 
-class TestGenerateMermaid:
-    def test_calls_gpt_and_extracts_code(self):
-        fake = "```mermaid\ngraph TD\n  A --> B\n```"
-        with patch("bot._gpt", return_value=fake) as mock_gpt:
-            result = bot.generate_mermaid("Meeting notes about project flow")
+class TestFetchPapers:
+    @pytest.mark.asyncio
+    async def test_returns_list_on_success(self):
+        fake_data = [make_paper()]
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = fake_data
 
-        assert result == "graph TD\n  A --> B"
-        mock_gpt.assert_called_once()
-        system, user = mock_gpt.call_args[0]
-        assert "транскрипц" in user.lower()
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
 
-    def test_returns_plain_text_if_no_code_block(self):
-        fake = "graph TD\n  A --> B"
-        with patch("bot._gpt", return_value=fake):
-            result = bot.generate_mermaid("some text")
-        assert result == "graph TD\n  A --> B"
+        with patch("bot.httpx.AsyncClient", return_value=mock_client):
+            result = await bot.fetch_papers("2024-01-15")
+
+        assert result == fake_data
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_for_non_list_response(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"error": "not found"}
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("bot.httpx.AsyncClient", return_value=mock_client):
+            result = await bot.fetch_papers("2024-01-15")
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_passes_date_as_query_param(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = []
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_client.get = AsyncMock(return_value=mock_resp)
+
+        with patch("bot.httpx.AsyncClient", return_value=mock_client):
+            await bot.fetch_papers("2024-06-01")
+
+        mock_client.get.assert_called_once_with(
+            bot.HF_API, params={"date": "2024-06-01"}
+        )
 
 
-class TestFixMermaid:
-    def test_calls_gpt_with_error_and_code(self):
-        fake = "```mermaid\ngraph TD\n  A --> B\n```"
-        with patch("bot._gpt", return_value=fake) as mock_gpt:
-            result = bot.fix_mermaid("graph TD\n  A ->-> B", "Parse error at line 2")
+# ── summarize ─────────────────────────────────────────────────────────────────
 
-        assert result == "graph TD\n  A --> B"
-        system, user = mock_gpt.call_args[0]
-        assert "Parse error" in user
-        assert "A ->-> B" in user
+class TestSummarize:
+    @pytest.mark.asyncio
+    async def test_returns_summary_from_openai(self):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "  Summary text.  "
 
-    def test_uses_fix_system_prompt(self):
-        with patch("bot._gpt", return_value="graph TD\n  A --> B") as mock_gpt:
-            bot.fix_mermaid("bad code", "error")
-
-        system, _ = mock_gpt.call_args[0]
-        assert system is bot._FIX_SYSTEM
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# _render_mmdc
-# ════════════════════════════════════════════════════════════════════════════════
-
-class TestRenderMmdc:
-    def _make_png(self) -> str:
-        """Создаёт временный файл, имитирующий PNG (>100 байт)."""
-        f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        f.write(b"\x89PNG" + b"x" * 200)
-        f.close()
-        return f.name
-
-    def test_success(self):
-        out = self._make_png()
-        mock_run = MagicMock(returncode=0)
-        with patch("bot.subprocess.run", return_value=mock_run):
-            ok, err = bot._render_mmdc("graph TD\n  A --> B", out)
-        assert ok is True
-        assert err == ""
-        Path(out).unlink(missing_ok=True)
-
-    def test_nonzero_exit_returns_error(self):
-        mock_run = MagicMock(returncode=1, stderr="Parse error", stdout="")
-        with patch("bot.subprocess.run", return_value=mock_run):
-            ok, err = bot._render_mmdc("bad code", "/tmp/nonexistent.png")
-        assert ok is False
-        assert "Parse error" in err
-
-    def test_mmdc_not_installed(self):
-        with patch("bot.subprocess.run", side_effect=FileNotFoundError):
-            ok, err = bot._render_mmdc("graph TD\n  A --> B", "/tmp/out.png")
-        assert ok is False
-        assert err == "mmdc_not_found"
-
-    def test_timeout(self):
-        with patch(
-            "bot.subprocess.run",
-            side_effect=subprocess.TimeoutExpired("mmdc", 40),
+        with patch.object(
+            bot.openai_client.chat.completions, "create", new=AsyncMock(return_value=mock_resp)
         ):
-            ok, err = bot._render_mmdc("graph TD\n  A --> B", "/tmp/out.png")
-        assert ok is False
-        assert "timeout" in err.lower()
+            result = await bot.summarize("Title", "Abstract text")
 
-    def test_empty_output_file_treated_as_failure(self):
-        out = tempfile.mktemp(suffix=".png")
-        Path(out).write_bytes(b"")            # файл есть, но пустой
-        mock_run = MagicMock(returncode=0, stderr="", stdout="")
-        with patch("bot.subprocess.run", return_value=mock_run):
-            ok, err = bot._render_mmdc("graph TD\n  A --> B", out)
-        assert ok is False
-        Path(out).unlink(missing_ok=True)
+        assert result == "Summary text."
 
+    @pytest.mark.asyncio
+    async def test_returns_fallback_for_empty_abstract(self):
+        result = await bot.summarize("Title", "")
+        assert result == "Аннотация недоступна."
 
-# ════════════════════════════════════════════════════════════════════════════════
-# _render_ink
-# ════════════════════════════════════════════════════════════════════════════════
+    @pytest.mark.asyncio
+    async def test_prompt_contains_title_and_abstract(self):
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = "Summary"
+        captured = {}
 
-class TestRenderInk:
-    def test_success_writes_file(self):
-        out = tempfile.mktemp(suffix=".png")
-        fake_bytes = b"\x89PNG" + b"x" * 200
-        mock_resp = MagicMock(
-            status_code=200,
-            headers={"content-type": "image/png"},
-            content=fake_bytes,
-        )
-        with patch("bot.httpx.get", return_value=mock_resp):
-            ok, err = bot._render_ink("graph TD\n  A --> B", out)
+        async def fake_create(**kwargs):
+            captured["messages"] = kwargs["messages"]
+            return mock_resp
 
-        assert ok is True
-        assert err == ""
-        assert Path(out).read_bytes() == fake_bytes
-        Path(out).unlink(missing_ok=True)
+        with patch.object(bot.openai_client.chat.completions, "create", side_effect=fake_create):
+            await bot.summarize("My Title", "My Abstract")
 
-    def test_http_error_status(self):
-        mock_resp = MagicMock(
-            status_code=400,
-            headers={"content-type": "text/plain"},
-            text="Bad Request",
-            content=b"",
-        )
-        with patch("bot.httpx.get", return_value=mock_resp):
-            ok, err = bot._render_ink("bad code", "/tmp/out.png")
-        assert ok is False
-        assert "400" in err
-
-    def test_non_image_content_type(self):
-        mock_resp = MagicMock(
-            status_code=200,
-            headers={"content-type": "text/html"},
-            text="Error page",
-            content=b"x" * 200,
-        )
-        with patch("bot.httpx.get", return_value=mock_resp):
-            ok, err = bot._render_ink("bad code", "/tmp/out.png")
-        assert ok is False
-
-    def test_timeout(self):
-        import httpx as httpx_lib
-        with patch("bot.httpx.get", side_effect=httpx_lib.TimeoutException("timeout")):
-            ok, err = bot._render_ink("graph TD\n  A --> B", "/tmp/out.png")
-        assert ok is False
-        assert "timeout" in err.lower()
-
-    def test_url_contains_base64_encoded_code(self):
-        import base64
-        code = "graph TD\n  A --> B"
-        expected_payload = base64.urlsafe_b64encode(code.encode()).decode()
-        captured_url = []
-
-        def fake_get(url, **kwargs):
-            captured_url.append(url)
-            return MagicMock(
-                status_code=400,
-                headers={"content-type": "text/plain"},
-                text="err",
-                content=b"",
-            )
-
-        with patch("bot.httpx.get", side_effect=fake_get):
-            bot._render_ink(code, "/tmp/out.png")
-
-        assert expected_payload in captured_url[0]
+        content = captured["messages"][0]["content"]
+        assert "My Title" in content
+        assert "My Abstract" in content
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# render_mermaid (оркестратор)
-# ════════════════════════════════════════════════════════════════════════════════
+# ── card_text ─────────────────────────────────────────────────────────────────
 
-class TestRenderMermaid:
-    def test_mmdc_success_skips_ink(self):
-        with patch("bot._render_mmdc", return_value=(True, "")) as mmdc, \
-             patch("bot._render_ink") as ink:
-            ok, err = bot.render_mermaid("graph TD\n  A --> B", "/tmp/out.png")
-        assert ok is True
-        ink.assert_not_called()
+class TestCardText:
+    def test_contains_counter(self):
+        paper = make_paper(summary="Summary here")
+        text = bot.card_text(paper, 0, 5)
+        assert "1 / 5" in text
 
-    def test_mmdc_error_falls_back_to_ink(self):
-        with patch("bot._render_mmdc", return_value=(False, "render error")), \
-             patch("bot._render_ink", return_value=(True, "")) as ink:
-            ok, err = bot.render_mermaid("graph TD\n  A --> B", "/tmp/out.png")
-        assert ok is True
-        ink.assert_called_once()
+    def test_contains_title(self):
+        paper = make_paper(title="Amazing Research", summary="Summary")
+        text = bot.card_text(paper, 0, 3)
+        assert "Amazing Research" in text
 
-    def test_mmdc_not_found_falls_back_to_ink(self):
-        with patch("bot._render_mmdc", return_value=(False, "mmdc_not_found")), \
-             patch("bot._render_ink", return_value=(True, "")) as ink:
-            ok, err = bot.render_mermaid("graph TD\n  A --> B", "/tmp/out.png")
-        assert ok is True
-        ink.assert_called_once()
+    def test_contains_summary(self):
+        paper = make_paper(summary="Key finding here")
+        text = bot.card_text(paper, 0, 1)
+        assert "Key finding here" in text
 
-    def test_both_backends_fail(self):
-        with patch("bot._render_mmdc", return_value=(False, "mmdc error")), \
-             patch("bot._render_ink", return_value=(False, "ink error")):
-            ok, err = bot.render_mermaid("bad code", "/tmp/out.png")
-        assert ok is False
-        assert err == "ink error"
+    def test_shows_up_to_three_authors(self):
+        authors = [{"name": f"Author{i}"} for i in range(5)]
+        paper = make_paper(authors=authors, summary="S")
+        text = bot.card_text(paper, 0, 1)
+        assert "et al." in text
+        assert "Author0" in text
+        assert "Author3" not in text
+
+    def test_escapes_html_in_title(self):
+        paper = make_paper(title="<b>bold</b>", summary="S")
+        text = bot.card_text(paper, 0, 1)
+        # The raw <b> tag should be escaped, not passed through as HTML
+        # card_text wraps title in its own <b>...</b>, so check inner content
+        assert "&lt;b&gt;" in text
+
+    def test_shows_date(self):
+        paper = make_paper(published="2024-03-22T10:00:00Z", summary="S")
+        text = bot.card_text(paper, 0, 1)
+        assert "2024-03-22" in text
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# Telegram-обработчики (async)
-# ════════════════════════════════════════════════════════════════════════════════
+# ── card_keyboard ─────────────────────────────────────────────────────────────
+
+class TestCardKeyboard:
+    def test_no_prev_button_on_first_card(self):
+        kb = bot.card_keyboard(0, 5, "2401.00001")
+        nav_row = kb.inline_keyboard[0]
+        labels = [btn.text for btn in nav_row]
+        assert "◀️" not in labels
+        assert "▶️" in labels
+
+    def test_no_next_button_on_last_card(self):
+        kb = bot.card_keyboard(4, 5, "2401.00001")
+        nav_row = kb.inline_keyboard[0]
+        labels = [btn.text for btn in nav_row]
+        assert "▶️" not in labels
+        assert "◀️" in labels
+
+    def test_both_buttons_in_middle(self):
+        kb = bot.card_keyboard(2, 5, "2401.00001")
+        nav_row = kb.inline_keyboard[0]
+        labels = [btn.text for btn in nav_row]
+        assert "◀️" in labels
+        assert "▶️" in labels
+
+    def test_counter_button_shows_position(self):
+        kb = bot.card_keyboard(1, 5, "2401.00001")
+        nav_row = kb.inline_keyboard[0]
+        counter = next(b for b in nav_row if "/" in b.text)
+        assert counter.text == "2/5"
+
+    def test_open_button_has_correct_url(self):
+        kb = bot.card_keyboard(0, 1, "2401.12345")
+        open_row = kb.inline_keyboard[1]
+        assert len(open_row) == 1
+        assert "2401.12345" in open_row[0].url
+
+    def test_prev_callback_data(self):
+        kb = bot.card_keyboard(3, 5, "2401.00001")
+        nav_row = kb.inline_keyboard[0]
+        prev = next(b for b in nav_row if b.text == "◀️")
+        assert prev.callback_data == "nav:2"
+
+    def test_next_callback_data(self):
+        kb = bot.card_keyboard(3, 5, "2401.00001")
+        nav_row = kb.inline_keyboard[0]
+        nxt = next(b for b in nav_row if b.text == "▶️")
+        assert nxt.callback_data == "nav:4"
+
+
+# ── cmd_start ─────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-class TestOnText:
-    async def test_replies_with_greeting(self):
+class TestCmdStart:
+    async def test_replies_with_help(self):
         update = MagicMock()
         update.message.reply_text = AsyncMock()
-        await bot.on_text(update, MagicMock())
+        await bot.cmd_start(update, MagicMock())
         update.message.reply_text.assert_called_once()
 
-    async def test_reply_mentions_audio(self):
+    async def test_mentions_papers_command(self):
         update = MagicMock()
         update.message.reply_text = AsyncMock()
-        await bot.on_text(update, MagicMock())
+        await bot.cmd_start(update, MagicMock())
         text = update.message.reply_text.call_args[0][0]
-        assert any(word in text.lower() for word in ("аудио", "голосов"))
+        assert "/papers" in text
 
+
+# ── cmd_papers ────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-class TestOnAudio:
-    def _make_update(self, *, voice=False, audio=False, doc_mime=None):
-        msg = MagicMock()
-        msg.reply_text = AsyncMock(return_value=MagicMock(edit_text=AsyncMock()))
-        msg.reply_photo = AsyncMock()
+class TestCmdPapers:
+    def _make_ctx(self, chat_id: int = 123):
+        ctx = MagicMock()
+        ctx.args = []
+        ctx.application.chat_data = {}
+        ctx.bot.send_message = AsyncMock()
+        return ctx
 
-        tg_file = AsyncMock()
-        tg_file.download_to_drive = AsyncMock()
+    async def test_uses_yesterday_when_no_args(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(
+            return_value=MagicMock(edit_text=AsyncMock(), delete=AsyncMock())
+        )
+        update.effective_chat.id = 42
+        ctx = self._make_ctx(42)
+        ctx.args = []
 
-        if voice:
-            msg.voice = MagicMock()
-            msg.voice.get_file = AsyncMock(return_value=tg_file)
-            msg.audio = None
-            msg.document = None
-        elif audio:
-            msg.audio = MagicMock(file_name="song.mp3")
-            msg.audio.get_file = AsyncMock(return_value=tg_file)
-            msg.voice = None
-            msg.document = None
-        elif doc_mime:
-            msg.document = MagicMock(
-                mime_type=doc_mime, file_name="file.mp3"
-            )
-            msg.document.get_file = AsyncMock(return_value=tg_file)
-            msg.voice = None
-            msg.audio = None
-        else:
-            msg.voice = None
-            msg.audio = None
-            msg.document = None
+        papers = [make_paper(summary="S")]
+        with patch("bot.fetch_papers", new=AsyncMock(return_value=papers)), \
+             patch("bot.summarize", new=AsyncMock(return_value="S")):
+            await bot.cmd_papers(update, ctx)
+
+    async def test_uses_provided_date_arg(self):
+        update = MagicMock()
+        update.message.reply_text = AsyncMock(
+            return_value=MagicMock(edit_text=AsyncMock(), delete=AsyncMock())
+        )
+        update.effective_chat.id = 99
+        ctx = self._make_ctx(99)
+        ctx.args = ["2024-05-01"]
+
+        papers = [make_paper(summary="S")]
+        captured_date = []
+
+        async def fake_fetch(date):
+            captured_date.append(date)
+            return papers
+
+        with patch("bot.fetch_papers", side_effect=fake_fetch):
+            await bot.cmd_papers(update, ctx)
+
+        assert captured_date[0] == "2024-05-01"
+
+
+# ── on_nav ────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestOnNav:
+    def _make_nav_update(self, data: str, chat_id: int = 1):
+        query = MagicMock()
+        query.data = data
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
 
         update = MagicMock()
-        update.message = msg
-        return update, msg
+        update.callback_query = query
+        update.effective_chat.id = chat_id
+        return update, query
 
-    async def test_non_audio_sends_error(self):
-        update, msg = self._make_update()
-        await bot.on_audio(update, MagicMock())
-        msg.reply_text.assert_called_once()
-        assert "аудио" in msg.reply_text.call_args[0][0].lower()
+    async def test_noop_does_nothing(self):
+        update, query = self._make_nav_update("noop")
+        ctx = MagicMock()
+        await bot.on_nav(update, ctx)
+        query.edit_message_text.assert_not_called()
 
-    async def test_non_audio_document_sends_error(self):
-        update, msg = self._make_update(doc_mime="application/pdf")
-        await bot.on_audio(update, MagicMock())
-        msg.reply_text.assert_called_once()
+    async def test_nav_updates_message(self):
+        papers = [make_paper(summary=f"S{i}") for i in range(3)]
+        update, query = self._make_nav_update("nav:2", chat_id=7)
+        ctx = MagicMock()
+        ctx.application.chat_data = {7: {"papers": papers, "index": 0}}
 
-    async def test_voice_message_sends_photo_on_success(self):
-        update, msg = self._make_update(voice=True)
+        await bot.on_nav(update, ctx)
 
-        with patch("bot.transcribe_audio", return_value="Meeting notes"), \
-             patch("bot.generate_mermaid", return_value="graph TD\n  A --> B"), \
-             patch("bot.render_mermaid", return_value=(True, "")), \
-             patch("builtins.open", MagicMock(
-                 __enter__=MagicMock(return_value=MagicMock()),
-                 __exit__=MagicMock(return_value=False),
-             )):
-            await bot.on_audio(update, MagicMock())
+        query.edit_message_text.assert_called_once()
+        kwargs = query.edit_message_text.call_args[1]
+        assert "3 / 3" in kwargs["text"]
 
-        msg.reply_photo.assert_called_once()
+    async def test_stale_session_sends_error(self):
+        update, query = self._make_nav_update("nav:1", chat_id=8)
+        ctx = MagicMock()
+        ctx.application.chat_data = {}
 
-    async def test_audio_file_sends_photo_on_success(self):
-        update, msg = self._make_update(audio=True)
+        await bot.on_nav(update, ctx)
 
-        with patch("bot.transcribe_audio", return_value="Notes"), \
-             patch("bot.generate_mermaid", return_value="graph TD\n  A --> B"), \
-             patch("bot.render_mermaid", return_value=(True, "")), \
-             patch("builtins.open", MagicMock(
-                 __enter__=MagicMock(return_value=MagicMock()),
-                 __exit__=MagicMock(return_value=False),
-             )):
-            await bot.on_audio(update, MagicMock())
+        query.edit_message_text.assert_called_once()
+        assert "устарела" in query.edit_message_text.call_args[0][0]
 
-        msg.reply_photo.assert_called_once()
+    async def test_out_of_bounds_index_ignored(self):
+        papers = [make_paper(summary="S")]
+        update, query = self._make_nav_update("nav:99", chat_id=9)
+        ctx = MagicMock()
+        ctx.application.chat_data = {9: {"papers": papers, "index": 0}}
 
-    async def test_transcription_error_reports_to_user(self):
-        update, msg = self._make_update(voice=True)
+        await bot.on_nav(update, ctx)
 
-        with patch("bot.transcribe_audio", side_effect=Exception("API error")):
-            await bot.on_audio(update, MagicMock())
-
-        # Статус-сообщение должно было обновиться с текстом ошибки
-        status = msg.reply_text.return_value
-        calls = [c[0][0] for c in status.edit_text.call_args_list]
-        assert any("❌" in t or "ошибк" in t.lower() for t in calls)
-
-    async def test_all_render_attempts_exhausted(self):
-        update, msg = self._make_update(voice=True)
-
-        with patch("bot.transcribe_audio", return_value="Notes"), \
-             patch("bot.generate_mermaid", return_value="graph TD\n  A --> B"), \
-             patch("bot.render_mermaid", return_value=(False, "render failed")), \
-             patch("bot.fix_mermaid", return_value="graph TD\n  A --> B"):
-            await bot.on_audio(update, MagicMock())
-
-        msg.reply_photo.assert_not_called()
-        status = msg.reply_text.return_value
-        last_call = status.edit_text.call_args_list[-1][0][0]
-        assert "❌" in last_call
+        query.edit_message_text.assert_not_called()
